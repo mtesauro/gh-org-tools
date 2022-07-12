@@ -30,7 +30,7 @@ func main() {
 
 	// Setup an API client to talk to Github's API
 	gh := ghAPIClient{}
-	err := setupClient(&gh, org)
+	err := setupClient(&gh, org, csvName)
 	if err != nil {
 		fmt.Printf("Error setting up the API client was %+v\n", err)
 		os.Exit(1)

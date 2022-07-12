@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type ghAPIClient struct {
@@ -19,6 +20,7 @@ type ghAPIClient struct {
 	Header     string
 	Token      string
 	Org        string
+	File       string
 	Meta       ghMeta
 }
 
@@ -33,7 +35,7 @@ type ghMeta struct {
 // setupClient takes a pointer to ghAPIClient, validates that
 // the required environmental variable 'GHTOKEN' exists and, if so,
 // creates a ghAPIClient with default values set
-func setupClient(g *ghAPIClient, o string) error {
+func setupClient(g *ghAPIClient, o string, f string) error {
 	// Setup the necessary config from the environment
 	t, present := os.LookupEnv("GHTOKEN")
 	if !present {
@@ -57,6 +59,7 @@ func setupClient(g *ghAPIClient, o string) error {
 	g.Header = "Authorization"
 	g.Token = "token " + t
 	g.Org = o
+	g.File = f
 	g.Meta.pagination = false
 	g.Meta.nextPage = 0
 	g.Meta.lastPage = 0
@@ -99,6 +102,8 @@ func resetMeta(g *ghAPIClient) {
 // Takes a pointer to ghAPIClient and generates a CSV of the
 // appropriate Github organization
 func generateGhCSV(g *ghAPIClient) error {
+	// Start the timer
+	orgTime := time.Now()
 	// Get info on the provided Github org
 	oInfo := []ghOrgInfo{}
 	err := getOrgInfo(g, &oInfo)
@@ -106,6 +111,7 @@ func generateGhCSV(g *ghAPIClient) error {
 		return err
 	}
 	resetMeta(g)
+	fmt.Printf("Get org info done in %v\n", time.Since(orgTime))
 
 	// Ensure we have a single results back for the org
 	if len(oInfo) > 1 {
@@ -113,29 +119,66 @@ func generateGhCSV(g *ghAPIClient) error {
 	}
 
 	// Use the Github org info to retrieve a list of repos for that GH org
+	repoTime := time.Now()
 	oRepos := ghRepoInfo{}
 	err = getOrgRepos(g, &oRepos)
 	if err != nil {
 		return errors.New(fmt.Sprintf("Problem preparing Request was: %v", err))
 	}
 	resetMeta(g)
+	fmt.Printf("Get org repos done in %v\n", time.Since(repoTime))
 
 	// For each repo in the GH org, get a list of collaborators to pull out those with admin roles
+	collabTime := time.Now()
+	rCollab := make(map[string]ghCollaborators)
+	rAdmins := make(map[string]ghCollaborators)
 	for k := range oRepos {
-		//fmt.Printf("FullName data for %+v\n", oRepos[k].FullName)
-		//fmt.Printf("Name data for %+v\n", oRepos[k].Name)
-		//fmt.Printf("CollaboratorsURL data for %+v\n", oRepos[k].CollaboratorsURL)
-		//fmt.Printf("Type for CollaboratorsURL %T\n", oRepos[k].CollaboratorsURL)
-		//
-		rCollab := make(map[string]ghCollaborators)
-		//current := oRepos[k].CollaboratorsURL
-		//name := oRepos[k].Name
-		rCollab[oRepos[k].Name], err = getCollabs(oRepos[k].CollaboratorsURL)
+		// Use Go routines to pull down collaborators and admins per repo
+		collabErr := make(chan error, 1)
+		go func() {
+			// Gather the collaborators and admins for the org's current repo
+			tempCollab := ghCollaborators{}
+			tempAdmins := ghCollaborators{}
+			err = getCollabs(g, oRepos[k].CollaboratorsURL, oRepos[k].Name, &tempCollab, &tempAdmins, g.Meta)
+			collabErr <- err
+
+			// Store collected values
+			rCollab[oRepos[k].Name] = tempCollab
+			rAdmins[oRepos[k].Name] = tempAdmins
+
+		}()
+		err = <-collabErr
+		if err != nil {
+			return errors.New(fmt.Sprintf("Problem preparing Collaborators request was: %v", err))
+		}
 	}
+	resetMeta(g)
+	fmt.Printf("Get repo collabs done in %v\n", time.Since(collabTime))
+
+	// Look at removing org admins from the repo admin list - might make for fewer admins
+	// see https://docs.github.com/en/rest/orgs/members#list-organization-members
 
 	// For each collaborator with an admin role, determine their name (human one vs GH login name aka Github username)
+	userTime := time.Now()
+	nameLookup := make(map[string]ghNameDetail)
+	for k := range oRepos {
+		err = getUserDetail(g, oRepos[k].Name, rAdmins, nameLookup)
+		if err != nil {
+			return err
+		}
+	}
+	resetMeta(g)
+	fmt.Printf("Get user detail done in %v\n", time.Since(userTime))
 
 	// Generate the CSV and write it out.
+	csvTime := time.Now()
+	err = writeCSV(g.File, &oRepos, rAdmins, nameLookup)
+	if err != nil {
+		return errors.New(fmt.Sprintf("Problem writing CSV file was: %v", err))
+	}
+
+	fmt.Printf("Get user detail done in %v\n", time.Since(csvTime))
+
 	return nil
 }
 
@@ -412,10 +455,186 @@ func getOrgRepos(g *ghAPIClient, oRepos *ghRepoInfo) error {
 	return nil
 }
 
-func getCollabs(raw string) (ghCollaborators, error) {
-	temp := make(ghCollaborators, 2)
+func getCollabs(g *ghAPIClient, raw string, repo string, c *ghCollaborators, a *ghCollaborators, lMeta ghMeta) error {
+	// Remove the gratuitous options part of the URL
 	link := strings.ReplaceAll(raw, "{/collaborator}", "")
-	fmt.Printf("Fixed link is %+v\n", link)
 
-	return temp, nil
+	// Add the URI for the Get collaborators call
+	// see https://docs.github.com/en/rest/collaborators/collaborators#list-repository-collaborators
+	if !lMeta.pagination {
+		addURI(g, "/repos/"+g.Org+"/"+repo+"/collaborators")
+
+		// Sanity check the calculated link vs the link provided by the Github API
+		if strings.Compare(link, g.FullURL.String()) != 0 {
+			return errors.New("Problem preparing Collaborators link")
+		}
+	}
+
+	// Setup temp data struct
+	tempCollab := ghCollaborators{}
+
+	// Setup the request
+	rawResp := ""
+	req, err := http.NewRequest(http.MethodGet, g.FullURL.String(), strings.NewReader(rawResp))
+	if err != nil {
+		return errors.New(fmt.Sprintf("Problem preparing Request was: %v", err))
+	}
+	req.Header.Add("content-type", "application/vnd.github+json")
+	req.Header.Add(g.Header, g.Token)
+
+	// Send the request
+	resp, err := g.HttpClient.Do(req)
+	if err != nil {
+		return errors.New(fmt.Sprintf("Problem sending Request was: %v", err))
+	}
+	defer resp.Body.Close()
+
+	// Read the response body
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return errors.New(fmt.Sprintf("Problem reading response body was: %v", err))
+	}
+
+	// Check the response code
+	if resp.StatusCode != 200 {
+		return errors.New(fmt.Sprintf("API response code for Repo collaborators was: %v", resp.StatusCode))
+	}
+
+	// Save the link header
+	lMeta.linkHeader = resp.Header.Get("link")
+
+	// Unmarshall data to struct
+	err = json.Unmarshal(body, &tempCollab)
+	if err != nil {
+		return errors.New(fmt.Sprintf("Problem unmarshalling JSON was: %v", err))
+	}
+
+	// Append the data collected so far
+	for k := range tempCollab {
+		*c = append(*c, tempCollab[k])
+		// Pull out admins to a seperate struct
+		if strings.Compare(tempCollab[k].RoleName, "admin") == 0 {
+			// Print the admin user
+			*a = append(*a, tempCollab[k])
+		}
+	}
+
+	// Check for pagination
+	err = pagedResults(&lMeta)
+	if err != nil {
+		return errors.New(fmt.Sprintf("Problem determining pagination was: %v", err))
+	}
+
+	if lMeta.pagination {
+		// Construct the new URL for the next page of results
+		addURI(g, "/repos/"+g.Org+"/"+repo+"/collaborators?page="+strconv.Itoa(lMeta.nextPage))
+		if lMeta.nextPage <= lMeta.lastPage {
+			// Increament the next page
+			err := getCollabs(g, raw, repo, c, a, lMeta)
+			if err != nil {
+				return errors.New(fmt.Sprintf("Problem requesting addition data pages was: %v", err))
+			}
+		}
+	}
+
+	return nil
+}
+
+// getUserDetail takes pointers to a map[string]ghCollaborators and map[string]ghNameDetail and
+// fills the ghNameDetail map using the Github username as the key.  APIs are reduced by looking
+// for an existing record in the lookup map (ghNameDetail)
+// see https://docs.github.com/en/rest/users/users#get-a-user
+func getUserDetail(g *ghAPIClient, repo string, adm map[string]ghCollaborators, lu map[string]ghNameDetail) error {
+	// Cycle though the collaborators for the provide repo
+	for _, v := range adm[repo] {
+		//fmt.Printf("k is %+v\nv is %+v\n", k, v)
+		// Use Go routines to pull down collaborators and admins per repo
+		usrErr := make(chan error, 1)
+		go func() {
+			// Gather the collaborators and admins for the org's current repo
+			err := getSingleUser(g, v.Login, lu)
+			//fmt.Printf("What is v's type: %T\n", v)
+			usrErr <- err
+		}()
+		err := <-usrErr
+		if err != nil {
+			return errors.New(fmt.Sprintf("Problem retrieving individual user data was: %v", err))
+		}
+	}
+
+	return nil
+}
+
+// see https://docs.github.com/en/rest/users/users#get-a-user
+func getSingleUser(g *ghAPIClient, l string, lu map[string]ghNameDetail) error {
+	// Check if login is already in the lookup map and return nil early
+	_, exists := lu[l]
+	if exists {
+		return nil
+	}
+
+	// Make the User API call to get the details for this user
+	err := userFromAPI(g, l, lu)
+	if exists {
+		return errors.New(fmt.Sprintf("Problem calling API for user data for %+v was: %v", l, err))
+	}
+
+	return nil
+}
+
+//
+func userFromAPI(g *ghAPIClient, l string, lu map[string]ghNameDetail) error {
+	// Add the URI for the Get organization call
+	// see https://docs.github.com/en/rest/orgs/orgs#get-an-organization
+	addURI(g, "/users/"+l)
+
+	// Setup temp data struct
+	tempUser := ghUser{}
+
+	// Setup the request
+	rawResp := ""
+	req, err := http.NewRequest(http.MethodGet, g.FullURL.String(), strings.NewReader(rawResp))
+	if err != nil {
+		return errors.New(fmt.Sprintf("Problem preparing Request was: %v", err))
+	}
+	req.Header.Add("content-type", "application/vnd.github+json")
+	req.Header.Add(g.Header, g.Token)
+
+	// Send the request
+	resp, err := g.HttpClient.Do(req)
+	if err != nil {
+		return errors.New(fmt.Sprintf("Problem sending Request was: %v", err))
+	}
+	defer resp.Body.Close()
+
+	// Read the response body
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return errors.New(fmt.Sprintf("Problem reading response body was: %v", err))
+	}
+
+	// Check the response code
+	if resp.StatusCode != 200 {
+		return errors.New(fmt.Sprintf("API response code for Org Info was: %v", resp.StatusCode))
+	}
+
+	// Unmarshall data to struct
+	err = json.Unmarshal(body, &tempUser)
+	if err != nil {
+		return errors.New(fmt.Sprintf("Problem unmarshalling JSON was: %v", err))
+	}
+
+	// Add details to the lookup map
+	lu[l] = ghNameDetail{
+		Name:  tempUser.Name,
+		Email: tempUser.Email,
+	}
+
+	// Check for pagination
+	err = pagedResults(&g.Meta)
+	if err != nil {
+		return errors.New(fmt.Sprintf("Problem determining pagination was: %v", err))
+	}
+
+	return nil
 }
